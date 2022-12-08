@@ -1,0 +1,928 @@
+---
+title: "Asset Pricing Fundamentals"
+output: html_notebook
+---
+## Introduction
+The CAPM is still the starting point in empirical asset pricing. Private investors and asset managers aim to beat the market, which means that they aim at creating portfolios that earn more than the (relevant) market portfolio. So, their portfolio should pay more than can be explained by its exposure to the market portfolio. However, from an asset pricing perspective, a situation of systematic outperformance of the market portfolio can actually mean that the risk exposure is not properly measured, or that the market portfolio is not efficient.
+Here, we are going to analyze efficient portfolios, test whether they outperform the market, create a new factor model based on our findings, analyze alternative explanations, and interpret our results from an asset pricing perspective.
+
+### Download libraries
+```{r}
+library(tidyverse)
+library(forecast)
+library(tseries)
+library(xts)
+library(ggplot2)
+library(readxl)
+library(gdata)
+library(Metrics)
+library(corrplot)
+library(WriteXLS)
+library(RColorBrewer)
+library(reshape2)
+library(GRS.test)
+library(lmtest)
+theme_set(theme_light())
+
+source("utils.R")
+```
+### Set parameters
+```{r}
+data_path = 'data'
+outputs_path = 'outputs'
+COLORS <- colorRampPalette(
+  c(
+    rep("red", 10), rep('aquamarine', 5), 'cyan', 'cornflowerblue',
+    'deepskyblue3', 'dodgerblue3', 'blue4'
+  )
+)
+file_path <- paste(data_path, 'size_BM.csv', sep="/") # file with size-BM portfolio returns
+market_file_path <- paste(data_path, 'general_data.xlsx', sep="/")
+momentum_file_path <- paste(data_path, 'size_book_to_market.xls', sep="/")
+```
+## Part 1: Efficient Portfolios and the CAPM
+Portfolios of stocks that have been sorted on firm or asset characteristics have become a standard approach for investments and empirical asset pricing. Many sorted portfolios are available from Kenneth French Data library. We will use portfolios from this website and analyze them.
+
+We use the US portfolios sorted based on market exposure and book-to-market ratio.
+
+### 1. Download and process data
+```{r}
+# Portfolio data
+raw_data <- read.csv(file_path, skip=15, stringsAsFactors = FALSE) # portfolio returns in % 
+raw_data$X <- as.Date(as.yearmon(as.character(raw_data$X), "%Y%m"), frac=1)
+raw_data <- raw_data %>% rename(time = X) %>% filter(time >= '1963-07-28' & 
+                                                     time <= '2017-01-31')
+raw_data[,2:ncol(raw_data)] <- sapply(raw_data[,2:ncol(raw_data)], as.numeric)
+row.names(raw_data) <- raw_data$time
+raw_data <- raw_data[,2:ncol(raw_data)]
+
+# Rename some columns
+raw_data <- raw_data %>% rename(`ME1.BM1` = `SMALL.LoBM`,
+                                `ME1.BM5` = `SMALL.HiBM`,
+                                `ME5.BM1` = `BIG.LoBM`,
+                                `ME5.BM5` = `BIG.HiBM`)
+
+# Assert no unexpected NaNs
+stopifnot(sum(raw_data == -99.99 | raw_data == -999) == 0) 
+
+raw_data <- 1 + raw_data/100 # to gross returns in decimals
+data <- raw_data # data to work with
+
+# Market data
+raw_market <- as.data.frame(read_excel(market_file_path,
+                            sheet='FamaFrench Factors', skip=4)) # returns in %
+raw_market$X__1 <- as.Date(as.yearmon(raw_market$...1, "%Y%m"), frac=1)
+raw_market <- raw_market %>% rename(time = X__1) %>% filter(time >= '1963-07-28' & 
+                                                       time <= '2017-01-31')
+row.names(raw_market) <- raw_market$time
+raw_market <- raw_market[,2:ncol(raw_market)]
+raw_market[,'mkt_return'] <- raw_market[,'Mkt-RF'] + raw_market[,'RF']
+
+market <- as.data.frame(1 + raw_market$mkt_return/100) # to gross returns in decimals
+colnames(market)[1] <- 'Market'
+row.names(market) <- row.names(raw_market)
+```
+### 2. Data description
+Here we analyze factor portfolios (means, variances and correlations).
+```{r}
+market_avgret <- mean(market$Market)
+market_retstd <- sd(market$Market)
+market_portfolio <- data.frame(gross_return=market_avgret, variance=market_retstd^2)
+
+mean_returns <- (colMeans(data)-1)*100 # means in % to show more differences
+variances <- sapply(data*100, sd, na.rm = TRUE)^2 # variances in %
+mean_var <- data.frame(
+  matrix(c(mean_returns, variances), ncol=2), 
+  row.names=colnames(data)
+)
+colnames(mean_var) <- c('mean, %', 'variance, %') 
+#WriteXLS(mean_var, ExcelFileName = "mean_var.xls", row.names=T)
+cor_matrix <- cor(cbind(data, market))
+#WriteXLS(as.data.frame(cor_matrix), ExcelFileName = "cor_matrix.xls", row.names=T)
+
+corr_plot <- corrplot(cor_matrix,
+                      method='color',
+                      type="full",
+                      addCoef.col="white",
+                      order='alphabet',
+                      tl.col="black",
+                      tl.srt=30,
+                      number.cex=.4, 
+                      tl.cex = .5,
+                      col = COLORS(20))
+#ggsave(paste(outputs_path, 'corr_plot_full.png', sep='/'), dpi=300, width=10, height=5)
+```
+### 3. Efficient portfolios
+We construct and graph the mean-variance frontier based on the factor portfolios and the market portfolio, when a riskless asset is not available. We also show the global minimum variance (GMV) portfolio and the "Mu" portofio.
+```{r}
+####  USING GROSS RETURNS IN DECIMALS ####
+gross_returns <- (cbind(data, market$Market))
+colnames(gross_returns)[ncol(gross_returns)] <- 'Market' 
+
+# GMV portfolio ####
+gmv_portfolio_result <- calculate_gmv_portfolio(gross_returns)
+pi_gmv <- gmv_portfolio_result$weights
+return_gmv <- gmv_portfolio_result$average_return
+sigma2_gmv <- gmv_portfolio_result$variance
+
+# MU portfolio ####
+mu_portfolio_result <- calculate_mu_portfolio(gross_returns)
+pi_mu <- mu_portfolio_result$weights
+return_mu <- mu_portfolio_result$average_return
+sigma2_mu <- mu_portfolio_result$variance
+
+gmv_mu_weights <- data.frame(
+  round(matrix(c(pi_gmv, pi_mu), ncol = 2)*100, 1),
+  row.names = colnames(gross_returns)
+)
+colnames(gmv_mu_weights) <- c('GMV', '\U003BC')
+#WriteXLS(gmv_pi_weights, 'gmv_pi_weights.xls', row.names=TRUE)
+
+gmv_mu_weights$portfolio <- row.names(gmv_mu_weights)
+gmv_mu_weights_reshaped <- melt(gmv_mu_weights, id.vars = 3)
+
+gmv_mu_weights_plot <- ggplot(gmv_mu_weights_reshaped,
+                              aes(x = portfolio, y = value, fill = variable)) + 
+                              geom_bar(stat = "identity", position = "dodge") + 
+                              geom_text(aes(label=value), vjust=1.6, 
+                                        color="black", size=1.7,
+                                        position = position_dodge(width = 1)) +
+                              labs(x='Portfolio', y='Weight, %', fill='') + 
+                              theme(axis.text.x = element_text(angle = 90, size=7), 
+                                    legend.position = 'bottom')
+gmv_mu_weights_plot
+#ggsave("gmv_mu_weights.png", dpi=300, width=10, height=5)
+```
+### 4. Portfolio frontier plot with risk-free asset
+From now on, we assume that a risk-free asset is available. First, we transform the portfolio returns to excess returns. Next, we calculate the tangency portfolio and discuss its properties.
+```{r}
+# including mu return!
+risky_assets_frontier <- data.frame(mu_targ_eff=sort(c(return_mu,
+                                    seq(return_gmv, 1.07, by=0.001))))
+po_prep_objs <- po_prepare(gross_returns) 
+A <- po_prep_objs$A
+B <- po_prep_objs$B
+C <- po_prep_objs$C
+
+risky_assets_frontier$stand_dev_eff <- sqrt((A-2*B*risky_assets_frontier$mu_targ_eff + 
+                                       C*risky_assets_frontier$mu_targ_eff^2)/(A*C-B^2))
+
+risky_assets_frontier$mu_targ_noneff <- seq(0.95, return_gmv, 
+                                            length.out=nrow(risky_assets_frontier))
+risky_assets_frontier$stand_dev_noneff <- sqrt((A-2*B*risky_assets_frontier$mu_targ_noneff + 
+                                        C*risky_assets_frontier$mu_targ_noneff^2)/(A*C-B^2))
+
+portfolios_ret_sd <- data.frame(gross_return=mu, sd=sqrt(diag(Sigma)))
+
+mean_variance_plot1 <- ggplot() + 
+                      geom_line(data=risky_assets_frontier, aes(x=stand_dev_eff, y=mu_targ_eff,
+                                 color='efficient part'), linewidth=1) +
+                      geom_line(data=risky_assets_frontier, aes(x=stand_dev_noneff, y=mu_targ_noneff, 
+                                 color='inefficient part'), linewidth=1) + 
+                      geom_point(data=risky_assets_frontier%>%filter(mu_targ_eff==return_gmv),
+                                  aes(x=stand_dev_eff, y=mu_targ_eff, color="GMV portfolio"), 
+                                 size=5, alpha=0.75) + 
+                      geom_point(data=risky_assets_frontier%>%filter(mu_targ_eff==return_mu),
+                                  aes(x=stand_dev_eff, y=mu_targ_eff, color="\U003BC portfolio"),
+                                  size=1) + 
+                      geom_point(data=portfolios_ret_sd, aes(x=sd, y=gross_return, 
+                                                             color='ME/BM portfolio'), size=1) + 
+                      geom_point(data=market_portfolio, aes(sqrt(variance), gross_return,
+                                                            color='market portfolio'), size=4, alpha=0.75) +
+                      scale_colour_manual(values = c("black", "green", 'grey', "red", "blue", 'orange'),
+                      guide = guide_legend(override.aes = list(
+                      linetype = c("blank", "blank", "blank", "solid", "solid", "blank"),
+                      shape = c(16, 16, 16, NA, NA, 16), size=c(1, 5, 4, 1, 1, 4)))) + 
+                      theme(legend.position = 'bottom') + 
+                      labs(x='Standard Deviation', y='Gross Return', color='')
+mean_variance_plot1
+```
+### Tangency portfolio
+```{r}
+# Add risk-free rate
+excess_returns <- gross_returns - (1+raw_market$RF/100)
+excess_mu <- as.matrix(colMeans(excess_returns))
+tang_result <- calculate_tangency_portfolio(gross_returns, raw_market$RF/100)
+
+# Plot tang structure
+pi_tang_df <- data.frame(
+  weight=round(pi_tang*100,1),
+  portfolio=colnames(gross_returns)
+)
+
+p <- ggplot(pi_tang_df, aes(portfolio, weight))
+p + geom_bar(stat = "identity", fill='royalblue') +
+  geom_text(aes(label=weight), vjust=1.6, color="black", size=2) + 
+  labs(x='Portfolio', y='Weight, %') + theme(axis.text.x = element_text(angle = 90, size=7))
+#ggsave("tang_weights.png", dpi=300, height=5, width=10)
+```
+### 4. Frontier with tangency portfolio
+We pick a value for gross risk-free rate (for example the most recent value, or the long- term average over your sample period) and add this to the means of the series of excess return to create gross returns again. Then, we draw the mean-variance frontier based on our portfolios and the market portfolio but without a risk-free asset, and the frontier with a risk-free asset. We also include the market portfolio in our graph.
+```{r}
+rf_assets_frontier <- data.frame(stand_dev=c(0, std_tang, std_tang*10))
+rf_assets_frontier$mu_targ_eff <- rf_assets_frontier$stand_dev*sqrt((t(excess_mu)%*%Sigma_inverted%*%excess_mu)[1,1])
+rf_assets_frontier$mu_targ_noneff <- -rf_assets_frontier$stand_dev*sqrt((t(excess_mu)%*%Sigma_inverted%*%excess_mu)[1,1])
+
+mean_variance_plot2 <- ggplot() + 
+                       geom_line(data=risky_assets_frontier, 
+                                 aes(x=stand_dev_eff, y=mu_targ_eff, color='efficient part'), size=1) +
+                       geom_line(data=risky_assets_frontier, aes(x=stand_dev_noneff, y=mu_targ_noneff,
+                                                                  color='inefficient part'), size=1) + 
+                       geom_point(data=risky_assets_frontier%>%filter(mu_targ_eff==return_gmv),
+                                  aes(x=stand_dev_eff, y=mu_targ_eff, color="GMV portfolio"), size=6, alpha=0.75) + 
+                       geom_point(data=risky_assets_frontier%>%filter(mu_targ_eff==return_mu),
+                                  aes(x=stand_dev_eff, y=mu_targ_eff, color="\U003BC portfolio"), size=2) + 
+                       geom_line(data=rf_assets_frontier,
+                                  aes(x=stand_dev, y=1+mean(raw_market$RF/100) + mu_targ_eff, color='efficient part'),
+                                  size=1) +
+                       geom_line(data=rf_assets_frontier, 
+                       aes(x=stand_dev, y=1+mean(raw_market$RF/100) + mu_targ_noneff, color='inefficient part'),
+                       size=1) +
+                       geom_point(data=portfolios_ret_sd, aes(x=sd, y=gross_return, color='ME/BM portfolio'), 
+                       size=2) + 
+                       geom_point(data=rf_assets_frontier%>%filter(stand_dev==std_tang),
+                                  aes(stand_dev, 1+mean(raw_market$RF/100)+mu_targ_eff, 
+                                  color='tangency portfolio'), size=5) + 
+                       geom_point(data=market_portfolio,
+                                  aes(sqrt(variance), gross_return, color='market portfolio'), size=5, alpha=0.75) + 
+                       coord_cartesian(xlim = c(0,0.1),ylim=c(0.975,1.05)) + theme(legend.position = 'bottom') +
+                       scale_colour_manual(values = c("black", "green", "grey", "red", "blue", "orange", "purple"),
+                                            guide = guide_legend(override.aes = list(
+                                              linetype = c("blank", "blank", "blank", "solid", "solid", rep("blank", 2)),
+                                              shape = c(16,16,16, NA, NA, rep(16, 2)), size=c(2,6,2,1,1,5,5)))) +
+                       labs(x='Standard Deviation', y='Gross Return', color='') + 
+                       scale_y_continuous(breaks=c(0.98 ,1, 1.02, 1.04)) + 
+                       scale_x_continuous(breaks=c(0, 0.025, 0.05, 0.075, 0.1))
+mean_variance_plot2
+#ggsave("mean_variance_full.png", dpi=300, width=10, height=5)
+```
+### 5. CAPM regressions
+Now we regress the excess returns of the portfolios on the excess market returns and a constant.
+```{r}
+capm_data <- excess_returns # sorted portfolios + market portfolio
+
+# ME1
+me1bm1 <- lm(data=capm_data, `ME1.BM1` ~ Market)
+summary(me1bm1)
+me1bm2 <- lm(data=capm_data, `ME1.BM2` ~ Market)
+summary(me1bm2)
+me1bm3 <- lm(data=capm_data, `ME1.BM3` ~ Market)
+summary(me1bm3)
+me1bm4 <- lm(data=capm_data, `ME1.BM4` ~ Market)
+summary(me1bm4)
+me1bm5 <- lm(data=capm_data, `ME1.BM5` ~ Market)
+summary(me1bm5)
+
+#ME2
+me2bm1 <- lm(data=capm_data, `ME2.BM1` ~ Market)
+summary(me2bm1)
+me2bm2 <- lm(data=capm_data, `ME2.BM2` ~ Market)
+summary(me2bm2)
+me2bm3 <- lm(data=capm_data, `ME2.BM3` ~ Market)
+summary(me2bm3)
+me2bm4 <- lm(data=capm_data, `ME2.BM4` ~ Market)
+summary(me2bm4)
+me2bm5 <- lm(data=capm_data, `ME2.BM5` ~ Market)
+summary(me2bm5)
+
+
+#ME3
+me3bm1 <- lm(data=capm_data, `ME3.BM1` ~ Market)
+summary(me3bm1)
+me3bm2 <- lm(data=capm_data, `ME3.BM2` ~ Market)
+summary(me3bm2)
+me3bm3 <- lm(data=capm_data, `ME3.BM3` ~ Market)
+summary(me3bm3)
+me3bm4 <- lm(data=capm_data, `ME3.BM4` ~ Market)
+summary(me3bm4)
+me3bm5 <- lm(data=capm_data, `ME3.BM5` ~ Market)
+summary(me3bm5)
+
+#ME4
+me4bm1 <- lm(data=capm_data, `ME4.BM1` ~ Market)
+summary(me4bm1)
+me4bm2 <- lm(data=capm_data, `ME4.BM2` ~ Market)
+summary(me4bm2)
+me4bm3 <- lm(data=capm_data, `ME4.BM3` ~ Market)
+summary(me4bm3)
+me4bm4 <- lm(data=capm_data, `ME4.BM4` ~ Market)
+summary(me4bm4)
+me4bm5 <- lm(data=capm_data, `ME4.BM5` ~ Market)
+summary(me4bm5)
+
+#ME5
+me5bm1 <- lm(data=capm_data, `ME5.BM1` ~ Market)
+summary(me5bm1)
+me5bm2 <- lm(data=capm_data, `ME5.BM2` ~ Market)
+summary(me5bm2)
+me5bm3 <- lm(data=capm_data, `ME5.BM3` ~ Market)
+summary(me5bm3)
+me5bm4 <- lm(data=capm_data, `ME5.BM4` ~ Market)
+summary(me5bm4)
+me5bm5 <- lm(data=capm_data, `ME5.BM5` ~ Market)
+summary(me5bm5)
+```
+### 7. GRS tests
+Conduct the GRS tests and interpret their outcome in relation to the CAPM.
+```{r}
+# And interpretation of the test outcome in relation to the CAPM ####
+
+E_matrix <- matrix(c(residuals(me1bm1), residuals(me1bm2), residuals(me1bm3), residuals(me1bm4), residuals(me1bm5),
+                     residuals(me2bm1), residuals(me2bm2), residuals(me2bm3), residuals(me2bm4), residuals(me2bm5),
+                     residuals(me3bm1), residuals(me3bm2), residuals(me3bm3), residuals(me3bm4), residuals(me3bm5),
+                     residuals(me4bm1), residuals(me4bm2), residuals(me4bm3), residuals(me4bm4), residuals(me4bm5),
+                     residuals(me5bm1), residuals(me5bm2), residuals(me5bm3), residuals(me5bm4), residuals(me5bm5)), 
+                     ncol=ncol(data))
+
+alpha_hat <- matrix(c(coef(me1bm1)[1], coef(me1bm2)[1], coef(me1bm3)[1], coef(me1bm4)[1], coef(me1bm5)[1],
+                      coef(me2bm1)[1], coef(me2bm2)[1], coef(me2bm3)[1], coef(me2bm4)[1], coef(me2bm5)[1],
+                      coef(me3bm1)[1], coef(me3bm2)[1], coef(me3bm3)[1], coef(me3bm4)[1], coef(me3bm5)[1],
+                      coef(me4bm1)[1], coef(me4bm2)[1], coef(me4bm3)[1], coef(me4bm4)[1], coef(me4bm5)[1],
+                      coef(me5bm1)[1], coef(me5bm2)[1], coef(me5bm3)[1], coef(me5bm4)[1], coef(me5bm5)[1]))
+
+beta_hat <- matrix(c(coef(me1bm1)[2], coef(me1bm2)[2], coef(me1bm3)[2], coef(me1bm4)[2], coef(me1bm5)[2],
+                     coef(me2bm1)[2], coef(me2bm2)[2], coef(me2bm3)[2], coef(me2bm4)[2], coef(me2bm5)[2], 
+                     coef(me3bm1)[2], coef(me3bm2)[2], coef(me3bm3)[2], coef(me3bm4)[2], coef(me3bm5)[2],
+                     coef(me4bm1)[2], coef(me4bm2)[2], coef(me4bm3)[2], coef(me4bm4)[2], coef(me4bm5)[2],
+                     coef(me5bm1)[2], coef(me5bm2)[2], coef(me5bm3)[2], coef(me5bm4)[2], coef(me5bm5)[2]))
+
+coeffs <- data.frame(t(matrix(c(alpha_hat, beta_hat), ncol=2)), row.names=c('alpha', 'beta'))
+colnames(coeffs) <- colnames(data)
+#WriteXLS(round(coeffs, 3), 'CAPM_coefs.xls', row.names=T)
+
+avg_forecast <- alpha_hat + beta_hat*mean(capm_data$Market)
+mispricing <- avg_forecast - mean_returns/100
+
+Sigma_tilde <- (t(E_matrix)%*%E_matrix)/nrow(E_matrix)
+stopifnot(dim(Sigma_tilde) == c(ncol(data), ncol(data)))
+
+finsamp_grs_result <- finite_sample_grs(
+  market_mean=market_avgret-1, market_std=market_retstd, T_period=nrow(data),
+  alpha_hat=alpha_hat, Sigma_tilde=Sigma_tilde
+)
+
+as_grs_result <- asymptotic_grs(
+  market_mean=market_avgret-1, market_std=market_retstd, T_period=nrow(data),
+  alpha_hat=alpha_hat, Sigma_tilde=Sigma_tilde
+)
+
+grs_tests_results <- rbind(finsamp_grs_result, as_grs_result)
+row.names(grs_tests_results) <- c('Finite-sample', 'Asymptotic')
+
+rapply(
+  grs_tests_results, f = round, classes = "numeric", how = "replace", digits = 2
+)
+
+sharpe_market <- (market_avgret-1)/market_retstd
+sharpe_improved <- sqrt(t(as.matrix(alpha_hat))%*%solve(Sigma_tilde)%*%as.matrix(alpha_hat) + 
+                          sharpe_market^2)[1,1]
+print(paste('Improvement in terms of Sharpe ratio:', round(sharpe_improved - sharpe_market, 2)))
+```
+
+# Part 2: Extending the CAPM with a Size Factor
+Many portfolio sorts lead to outperformance of the market portfolio. The characteristic on which the sort has been based may provide a proxy for the exposure to a latent risk factor. Fama and French (1993) and Carhart (1997) show that one captures the effect of a risk factor or strategy by the construction of a factor portfolio. We will analyze whether our portfolio returns are related to the size effect.
+
+## 1. Factor construction
+Construct a size factor based on the ten size portfolio and analyze its properties.
+```{r}
+# TODO
+factor <- as.data.frame(read_excel(market_file_path, sheet='Size factor')) # returns in %
+#mean, variance, plot, autocorrelation
+factor$Date <- as.Date(as.yearmon(as.character(factor$Date), "%Y%m"), frac=1)
+factor = factor %>% filter(Date >= row.names(data)[1])
+
+summary(factor)
+print(
+  paste('Variance:', round(var(factor$`Size factor`), 2))
+)
+#factor.xts <- xts(factor$`Size factor`, order.by=factor$Date)
+#plot.xts(factor.xts)
+
+size_factor_plot <- ggplot(factor, aes(x=Date, y=`Size factor`)) + geom_line() +
+  scale_x_date(date_breaks = '5 years', date_labels="%b-%Y") + 
+  labs(x="Date", y="Size Factor, %") +
+  coord_cartesian(xlim=c(factor$Date[20], factor$Date[nrow(factor)-20]))
+#ggsave("size_factor_dynamics.png", dpi=300, width=10, height=5)
+
+size_factor_acf <- acf(factor$`Size factor`, lag.max = 100, plot = TRUE)
+size_factor_acf_plot <- ggAcf(factor$`Size factor`, lag.max = 100, type = "correlation") + labs(title='')
+size_factor_acf_plot
+#ggsave("size_factor_acf.png", dpi=300, width=10, height=5)
+autocorr <- acf(factor$`Size factor`, lag.max = 200, plot = TRUE) # TODO: remove?
+```
+The largest significant autocorrelation for the size factor is at 12th lag (0.179). That is, there is an annual seasonality.
+
+### 2. Regress the size factor returns on the excess market returns and a constant, and discuss the outcomes.
+```{r}
+#Regression1
+# regress size factor on excess market return 
+# TODO: remove the below? should there be any regression?
+# # Market data
+# raw_market <- as.data.frame(read_excel(market_file_path,
+#                                        sheet='FamaFrench Factors', skip=4)) # returns in %
+# glimpse(raw_market)
+# raw_market[,1] <- as.Date(as.yearmon(raw_market[,1], "%Y%m"), frac=1)
+# # HERE X__1 OR ...1 !!!
+# raw_market <- raw_market %>% rename(time = X__1) %>% filter(time >= '1963-07-28' & 
+#                                                               time <= '2017-01-31')
+# row.names(raw_market) <- raw_market$time
+# raw_market <- raw_market[,2:ncol(raw_market)]
+# raw_market[,'mkt_return'] <- raw_market[,'Mkt-RF'] + raw_market[,'RF']
+
+df_factor_excess_market <- as.data.frame(
+  cbind(factor$`Size factor`, raw_market$`Mkt-RF`),
+  row.names=row.names(raw_market)
+)
+colnames(df_factor_excess_market) <- c('Size factor', 'Mkt-RF')
+
+factor_MarketExcess_regression <- lm(data=df_factor_excess_market, `Size factor`~`Mkt-RF`)
+summary(factor_MarketExcess_regression)
+```
+3. Regress the portfolio excess returns on the excess market returns and the size factor, and conduct the GRS-test. Discuss the outcomes. Is the size factor relevant? Does it help explain the cross-sectional differences between the expected portfolio returns? What does it mean for an investor?
+```{r}
+# data to simple percentage returns 
+perc_Portfolio_returns=(data-1)*100-raw_market$RF # EXCESS RETURNS!
+
+df_portfolios_factors <-merge(perc_Portfolio_returns, df_factor_excess_market, by=0, all=TRUE)
+row.names(df_portfolios_factors) <- df_portfolios_factors$Row.names
+df_portfolios_factors <- df_portfolios_factors[,2:ncol(df_portfolios_factors)]
+
+# ME1
+me1bm1 <- lm(data=df_portfolios_factors, `ME1.BM1` ~ `Mkt-RF`+`Size factor`)
+summary(me1bm1)
+me1bm2 <- lm(data=df_portfolios_factors, `ME1.BM2` ~ `Mkt-RF`+`Size factor`)
+summary(me1bm2)
+me1bm3 <- lm(data=df_portfolios_factors, `ME1.BM3` ~ `Mkt-RF`+`Size factor`)
+summary(me1bm3)
+me1bm4 <- lm(data=df_portfolios_factors, `ME1.BM4` ~ `Mkt-RF`+`Size factor`)
+summary(me1bm4)
+me1bm5 <- lm(data=df_portfolios_factors, `ME1.BM5` ~ `Mkt-RF`+`Size factor`)
+summary(me1bm5)
+
+#ME2
+me2bm1 <- lm(data=df_portfolios_factors, `ME2.BM1` ~ `Mkt-RF`+`Size factor`)
+summary(me2bm1)
+me2bm2 <- lm(data=df_portfolios_factors, `ME2.BM2` ~ `Mkt-RF`+`Size factor`)
+summary(me2bm2)
+me2bm3 <- lm(data=df_portfolios_factors, `ME2.BM3` ~ `Mkt-RF`+`Size factor`)
+summary(me2bm3)
+me2bm4 <- lm(data=df_portfolios_factors, `ME2.BM4` ~ `Mkt-RF`+`Size factor`)
+summary(me2bm4)
+me2bm5 <- lm(data=df_portfolios_factors, `ME2.BM5` ~ `Mkt-RF`+`Size factor`)
+summary(me2bm5)
+
+#ME3
+me3bm1 <- lm(data=df_portfolios_factors, `ME3.BM1` ~ `Mkt-RF`+`Size factor`)
+summary(me3bm1)
+me3bm2 <- lm(data=df_portfolios_factors, `ME3.BM2` ~ `Mkt-RF`+`Size factor`)
+summary(me3bm2)
+me3bm3 <- lm(data=df_portfolios_factors, `ME3.BM3` ~ `Mkt-RF`+`Size factor`)
+summary(me3bm3)
+me3bm4 <- lm(data=df_portfolios_factors, `ME3.BM4` ~ `Mkt-RF` +`Size factor`)
+summary(me3bm4)
+me3bm5 <- lm(data=df_portfolios_factors, `ME3.BM5` ~ `Mkt-RF` +`Size factor`)
+summary(me3bm5)
+
+#ME4
+me4bm1 <- lm(data=df_portfolios_factors, `ME4.BM1` ~ `Mkt-RF` +`Size factor`)
+summary(me4bm1)
+me4bm2 <- lm(data=df_portfolios_factors, `ME4.BM2` ~ `Mkt-RF` +`Size factor`)
+summary(me4bm2)
+me4bm3 <- lm(data=df_portfolios_factors, `ME4.BM3` ~ `Mkt-RF` +`Size factor`)
+summary(me4bm3)
+me4bm4 <- lm(data=df_portfolios_factors, `ME4.BM4` ~ `Mkt-RF` +`Size factor`)
+summary(me4bm4)
+me4bm5 <- lm(data=df_portfolios_factors, `ME4.BM5` ~ `Mkt-RF` +`Size factor`)
+summary(me4bm5)
+
+#ME5
+me5bm1 <- lm(data=df_portfolios_factors, `ME5.BM1` ~ `Mkt-RF` +`Size factor`)
+summary(me5bm1)
+me5bm2 <- lm(data=df_portfolios_factors, `ME5.BM2` ~ `Mkt-RF` +`Size factor`)
+summary(me5bm2)
+me5bm3 <- lm(data=df_portfolios_factors, `ME5.BM3` ~ `Mkt-RF` +`Size factor`)
+summary(me5bm3)
+me5bm4 <- lm(data=df_portfolios_factors, `ME5.BM4` ~ `Mkt-RF` +`Size factor`)
+summary(me5bm4)
+me5bm5 <- lm(data=df_portfolios_factors, `ME5.BM5` ~ `Mkt-RF` +`Size factor`)
+summary(me5bm5)
+
+# GRS-test
+
+E_matrix <- matrix(
+  c(residuals(me1bm1), residuals(me1bm2), residuals(me1bm3), residuals(me1bm4), residuals(me1bm5),
+    residuals(me2bm1), residuals(me2bm2), residuals(me2bm3), residuals(me2bm4), residuals(me2bm5),
+    residuals(me3bm1), residuals(me3bm2), residuals(me3bm3), residuals(me3bm4), residuals(me3bm5),
+    residuals(me4bm1), residuals(me4bm2), residuals(me4bm3), residuals(me4bm4), residuals(me4bm5),
+    residuals(me5bm1), residuals(me5bm2), residuals(me5bm3), residuals(me5bm4), residuals(me5bm5)),
+    ncol=ncol(data)
+)
+
+# Intercepts
+alpha_hat <- matrix(
+  c(coef(me1bm1)[1], coef(me1bm2)[1], coef(me1bm3)[1], coef(me1bm4)[1], coef(me1bm5)[1],
+    coef(me2bm1)[1], coef(me2bm2)[1], coef(me2bm3)[1], coef(me2bm4)[1], coef(me2bm5)[1],
+    coef(me3bm1)[1], coef(me3bm2)[1], coef(me3bm3)[1], coef(me3bm4)[1], coef(me3bm5)[1],
+    coef(me4bm1)[1], coef(me4bm2)[1], coef(me4bm3)[1], coef(me4bm4)[1], coef(me4bm5)[1],
+    coef(me5bm1)[1], coef(me5bm2)[1], coef(me5bm3)[1], coef(me5bm4)[1], coef(me5bm5)[1]))
+
+# Market betas
+beta_hat <- matrix(
+  c(coef(me1bm1)[2], coef(me1bm2)[2], coef(me1bm3)[2], coef(me1bm4)[2], coef(me1bm5)[2],
+    coef(me2bm1)[2], coef(me2bm2)[2], coef(me2bm3)[2], coef(me2bm4)[2], coef(me2bm5)[2], 
+    coef(me3bm1)[2], coef(me3bm2)[2], coef(me3bm3)[2], coef(me3bm4)[2], coef(me3bm5)[2],
+    coef(me4bm1)[2], coef(me4bm2)[2], coef(me4bm3)[2], coef(me4bm4)[2], coef(me4bm5)[2],
+    coef(me5bm1)[2], coef(me5bm2)[2], coef(me5bm3)[2], coef(me5bm4)[2], coef(me5bm5)[2])
+)
+
+# Exposures to the size factor
+gamma_hat <- matrix(
+  c(coef(me1bm1)[3], coef(me1bm2)[3], coef(me1bm3)[3], coef(me1bm4)[3], coef(me1bm5)[3],
+    coef(me2bm1)[3], coef(me2bm2)[3], coef(me2bm3)[3], coef(me2bm4)[3], coef(me2bm5)[3], 
+    coef(me3bm1)[3], coef(me3bm2)[3], coef(me3bm3)[3], coef(me3bm4)[3], coef(me3bm5)[3],
+    coef(me4bm1)[3], coef(me4bm2)[3], coef(me4bm3)[3], coef(me4bm4)[3], coef(me4bm5)[3],
+    coef(me5bm1)[3], coef(me5bm2)[3], coef(me5bm3)[3], coef(me5bm4)[3], coef(me5bm5)[3])
+)
+
+coeffs <- data.frame(
+  t(matrix(c(alpha_hat, beta_hat, gamma_hat), ncol=3)), 
+  row.names=c('alpha', 'beta','gamma')
+)
+colnames(coeffs) <- colnames(data)
+
+#avg_forecast <- alpha_hat + beta_hat*mean(capm_data$Market)
+#mispricing <- avg_forecast - mean_returns/100
+
+#WriteXLS(round(coeffs, 3), 'CAPM_coefs.xls', row.names=T)
+
+Sigma_tilde <- (t(E_matrix)%*%E_matrix)/nrow(E_matrix)
+dim(Sigma_tilde) == c(ncol(data), ncol(data))
+
+# FiniteSampleGRS2 <- function(factors_mean, factors_cov, T_period, alpha_hat, Sigma_tilde){
+#   n <- dim(Sigma_tilde)[1]
+#   k <- dim(as.matrix(colMeans(factors_mean)))[1]
+#   sharpe_squared <- as.numeric(t(as.matrix(factors_mean))%*%solve(factors_cov)%*%as.matrix(factors_mean))
+# 
+#   z = (T_period-n-k)/n * (1 + sharpe_squared)^(-1) * (t(as.matrix(alpha_hat))%*%solve(Sigma_tilde)%*%as.matrix(alpha_hat))[1,1]
+#   return(z)
+# }
+
+# AsymptoticGRS2 <- function(factors_mean, factors_cov, T_period, alpha_hat, Sigma_tilde){
+#   sharpe_squared <- as.numeric(t(as.matrix(factors_mean))%*%solve(factors_cov)%*%as.matrix(factors_mean))
+#   z = T_period/(1 + sharpe_squared) * (t(as.matrix(alpha_hat))%*%solve(Sigma_tilde)%*%as.matrix(alpha_hat))[1,1]
+#   return(z)
+# }
+
+grs_finsamp_result_factors <-
+  finite_sample_grs2(factors_mean=as.matrix(colMeans(df_factor_excess_market)),
+                     factors_cov=cov(df_factor_excess_market),
+                     T_period=nrow(data),
+                     alpha_hat=alpha_hat,
+                     Sigma_tilde=Sigma_tilde
+  )
+
+grs_as_result_factors <- 
+  asymptotic_grs2(
+    factors_mean=as.matrix(colMeans(df_factor_excess_market)),
+    factors_cov=cov(df_factor_excess_market), T_period=nrow(data),
+    alpha_hat=alpha_hat, Sigma_tilde=Sigma_tilde
+)
+
+grs_tests_results_factors <- rbind(grs_finsamp_result_factors, grs_as_result_factors)
+row.names(grs_tests_results_factors) <- c('Finite-sample', 'Asymptotic')
+
+rapply(
+  grs_tests_results_factors, f = round, classes = "numeric", how = "replace", digits = 2
+)
+```
+## Part 3: The Influence of Momentum
+Momentum is strongly present in equity returns. Perhaps it explains quite a bit of the returns of the portfolios that we have selected.
+### 1. Momentum factor construction
+For each test portfolio and each month t, we calculate the cumulative returns over the months t−12 to t−2 (month t−1 is not used).
+```{r}
+# TODO
+#   This has been done in size_book_to_market.xls
+momentum <- as.data.frame(read_excel(momentum_file_path, sheet='momentum (cum)'))
+momentum$...1 <- as.Date(as.character(momentum$...1))
+row.names(momentum) <- momentum$...1
+momentum <- momentum[,2:ncol(momentum)] # remove the column with dates
+momentum <- momentum*100 # raw returns in %
+colnames(momentum) <- paste0('mom_', colnames(momentum))
+
+# using simple returns!
+fmb_data <- merge(perc_Portfolio_returns + raw_market$RF, momentum, by=0, all=TRUE)
+row.names(fmb_data) <- row.names(momentum)
+fmb_data <- na.omit(fmb_data)
+fmb_data <- fmb_data[,2:ncol(fmb_data)]
+```
+### 2. Conduct the first step of the Fama-MacBeth procedure. That is, for each time t we run a cross-sectional regression of the portfolio returns on the cumulative returns calculated in the previous step. We make a graph of the resulting time series of slope coefficients, and discuss your results.
+```{r}
+momentum_coefs <- c()
+momentum_p.values <- c()
+for (time in 1:nrow(fmb_data)){
+  X <- data.frame(return=t(fmb_data[time,1:25]), momentum=t(fmb_data[time,26:50]))
+  colnames(X) <- c('return', 'momentum')
+  model <- lm(data=X, return ~ momentum)
+  momentum_coefs <- c(momentum_coefs, coef(model)[2])
+  momentum_p.values <- c(momentum_p.values, summary(model)$coefficients[,4][2])
+}
+
+momentum_coef_ts <- data.frame(Date=as.Date(row.names(fmb_data)), 
+                               Momentum_coef=momentum_coefs,
+                               Momentum_p_value=momentum_p.values,
+                               Signficant=momentum_p.values<0.05)
+
+momentum_coef_dynamics_plot <- ggplot(data=momentum_coef_ts, aes(Date, Momentum_coef)) + geom_line() +
+  scale_x_date(date_breaks = '5 years', date_labels="%b-%Y") + 
+  labs(x="Date", y="Momentum coef.") +
+  coord_cartesian(xlim=c(momentum_coef_ts$Date[20],
+                         momentum_coef_ts$Date[nrow(momentum_coef_ts)-20]))
+momentum_coef_plot
+#ggsave("momentum_coef_dynamics.png", dpi=300, width=10, height=5)
+
+momentum_coef_significance_plot <- ggplot(data=momentum_coef_ts, aes(Date, Momentum_coef, color=Signficant)) + 
+  geom_point() +
+  scale_x_date(date_breaks = '5 years', date_labels="%b-%Y") + 
+  labs(x="Date", y="Momentum coef.") +
+  coord_cartesian(xlim=c(momentum_coef_ts$Date[20],
+                         momentum_coef_ts$Date[nrow(momentum_coef_ts)-20]))
+momentum_coef_significance_plot
+#ggsave("momentum_coef_significance.png", dpi=300, width=10, height=5)
+```
+### 3. Conduct the second step of the Fama-MacBeth procedure. That is, we calculate the average slope coefficient and test for its significance. Is the momentum effect important?
+```{r}
+sum(momentum_coef_ts$Signficant)/nrow(momentum_coef_ts)
+
+fama_macbeth_test_result <- fama_macbeth_test(momentum_coef_ts$Momentum_coef)
+fama_macbeth_test_result
+```
+## Part 4: The Influence of Consumption
+A fundamental insight of asset pricing is that expected returns should be explained by their covariance with the marginal utility of consumption. So, perhaps we should use consumption data as a risk factor. Yogo (2006) shows that it is a good idea to separate durable and non-durable consumption. Consumption data is available from the Federal Reserve Bank of St. Louis.
+
+### 1. Analyze data on consumption growth rates for durables and non- durables (corrected for inflation).
+```{r}
+# TODO: remove? 
+# market_file_path <- '527144ma_386879ak_general_data.xlsx'
+consumption <- as.data.frame(
+  read_excel(market_file_path, sheet='Consumption data', skip = 5)
+) # consumption growth rates in % for durables and non-durables, corrected for inflation
+consumption$Date <- as.Date(as.yearmon(as.character(consumption$Date), "%Y%m"), frac=1)
+# slice data
+consumption <- consumption %>% filter(Date >= '1963-07-28' & Date <= '2017-01-31') 
+
+consumption_growth_plot <- ggplot(consumption, aes(x=Date, y=Durables, color='durables')) + geom_line() +
+  geom_line(data=consumption, aes(x=Date, y=`Non-durables`, color='non-durables')) +
+  scale_x_date(date_breaks = '5 years', date_labels="%b-%Y") + 
+  labs(x="Date", y="Consumption Growth, %") + theme(legend.position = 'bottom') + 
+  guides(color=guide_legend(title="Consumption type")) +
+  coord_cartesian(xlim=c(consumption$Date[20], consumption$Date[nrow(consumption)-20]))
+consumption_growth_plot
+#ggsave("consumption_dynamics.png", dpi=300, width=10, height=5)
+
+summary(consumption)
+var(consumption[,2:3])
+cor(consumption[,2:3])
+```
+### 2. Conduct a time-series regression of the portfolio excess returns on the consumption growth rates and a constant.
+```{r}
+# Market data
+# TODO: remove?
+# raw_market <- as.data.frame(
+#   read_excel(market_file_path, sheet='FamaFrench Factors', skip=4)) # returns in %
+# glimpse(raw_market)
+# raw_market[,1] <- as.Date(as.yearmon(raw_market[,1], "%Y%m"), frac=1)
+# raw_market <- raw_market %>% dplyr::rename(time = ...1) %>% filter(time >= '1963-07-28' & 
+#                                                               time <= '2017-01-31')
+# row.names(raw_market) <- raw_market$time
+# market <- raw_market[,2:ncol(raw_market)]
+
+## Convert returns to excess returns
+portfolio_excess_returns <- data - market[,1]
+# Dates match
+stopifnot(row.names(portfolio_excess_returns)[1] == consumption$Date[1])
+stopifnot(row.names(portfolio_excess_returns)[nrow(portfolio_excess_returns)] == consumption$Date[nrow(consumption)])
+portfolio_excess_returns_consumption <- cbind(portfolio_excess_returns, consumption) %>%
+                                        dplyr::select(-Date)
+
+#### Regressions ####
+# ME1
+me1bm1 <- lm(data=portfolio_excess_returns_consumption, `ME1.BM1` ~ Durables + `Non-durables`)
+summary(me1bm1)
+me1bm2 <- lm(data=portfolio_excess_returns_consumption, `ME1.BM2` ~ Durables + `Non-durables`)
+summary(me1bm2)
+me1bm3 <- lm(data=portfolio_excess_returns_consumption, `ME1.BM3` ~ Durables + `Non-durables`)
+summary(me1bm3)
+me1bm4 <- lm(data=portfolio_excess_returns_consumption, `ME1.BM4` ~ Durables + `Non-durables`)
+summary(me1bm4)
+me1bm5 <- lm(data=portfolio_excess_returns_consumption, `ME1.BM5` ~ Durables + `Non-durables`)
+summary(me1bm5)
+
+#ME2
+me2bm1 <- lm(data=portfolio_excess_returns_consumption, `ME2.BM1` ~ Durables + `Non-durables`)
+summary(me2bm1)
+me2bm2 <- lm(data=portfolio_excess_returns_consumption, `ME2.BM2` ~ Durables + `Non-durables`)
+summary(me2bm2)
+me2bm3 <- lm(data=portfolio_excess_returns_consumption, `ME2.BM3` ~ Durables + `Non-durables`)
+summary(me2bm3)
+me2bm4 <- lm(data=portfolio_excess_returns_consumption, `ME2.BM4` ~ Durables + `Non-durables`)
+summary(me2bm4)
+me2bm5 <- lm(data=portfolio_excess_returns_consumption, `ME2.BM5` ~ Durables + `Non-durables`)
+summary(me2bm5)
+
+#ME3
+me3bm1 <- lm(data=portfolio_excess_returns_consumption, `ME3.BM1` ~ Durables + `Non-durables`)
+summary(me3bm1)
+me3bm2 <- lm(data=portfolio_excess_returns_consumption, `ME3.BM2` ~ Durables + `Non-durables`)
+summary(me3bm2)
+me3bm3 <- lm(data=portfolio_excess_returns_consumption, `ME3.BM3` ~ Durables + `Non-durables`)
+summary(me3bm3)
+me3bm4 <- lm(data=portfolio_excess_returns_consumption, `ME3.BM4` ~ Durables + `Non-durables`)
+summary(me3bm4)
+me3bm5 <- lm(data=portfolio_excess_returns_consumption, `ME3.BM5` ~ Durables + `Non-durables`)
+summary(me3bm5)
+
+#ME4
+me4bm1 <- lm(data=portfolio_excess_returns_consumption, `ME4.BM1` ~ Durables + `Non-durables`)
+summary(me4bm1)
+me4bm2 <- lm(data=portfolio_excess_returns_consumption, `ME4.BM2` ~ Durables + `Non-durables`)
+summary(me4bm2)
+me4bm3 <- lm(data=portfolio_excess_returns_consumption, `ME4.BM3` ~ Durables + `Non-durables`)
+summary(me4bm3)
+me4bm4 <- lm(data=portfolio_excess_returns_consumption, `ME4.BM4` ~ Durables + `Non-durables`)
+summary(me4bm4)
+me4bm5 <- lm(data=portfolio_excess_returns_consumption, `ME4.BM5` ~ Durables + `Non-durables`)
+summary(me4bm5)
+
+#ME5
+me5bm1 <- lm(data=portfolio_excess_returns_consumption, `ME5.BM1` ~ Durables + `Non-durables`)
+summary(me5bm1)
+me5bm2 <- lm(data=portfolio_excess_returns_consumption, `ME5.BM2` ~ Durables + `Non-durables`)
+summary(me5bm2)
+me5bm3 <- lm(data=portfolio_excess_returns_consumption, `ME5.BM3` ~ Durables + `Non-durables`)
+summary(me5bm3)
+me5bm4 <- lm(data=portfolio_excess_returns_consumption, `ME5.BM4` ~ Durables + `Non-durables`)
+summary(me5bm4)
+me5bm5 <- lm(data=portfolio_excess_returns_consumption, `ME5.BM5` ~ Durables + `Non-durables`)
+summary(me5bm5)
+       
+ts_models <- list(
+  me1bm1, me1bm2, me1bm3, me1bm4, me1bm5,
+  me2bm1, me2bm2, me2bm3, me2bm4, me2bm5,
+  me3bm1, me3bm2, me3bm3, me3bm4, me3bm5,
+  me4bm1, me4bm2, me4bm3, me4bm4, me4bm5,
+  me5bm1, me5bm2, me5bm3, me5bm4, me5bm5
+)
+
+# Residuals autocorrelation test
+DW.p_values <- c()
+for (portfolio in colnames(portfolio_excess_returns)){
+  "Two-sided Durbin-Watson test for autocorrelation"
+  dw.p_value <- dwtest(portfolio_excess_returns_consumption[,portfolio] ~ 
+                                            portfolio_excess_returns_consumption$Durables,
+                                            portfolio_excess_returns_consumption$`Non-durables`,
+                                            alternative = 'two.sided')[['p.value']]
+  DW.p_values <- c(DW.p_values, dw.p_value)
+  
+  print(portfolio)
+  print(dw.p_value)
+}
+plot(DW.p_values)
+
+# Residual heteroscedasticity test
+BP.p_values <- c()
+for (model in ts_models){
+  "Breusch-Pagan test for heteroscedasticity"
+  bp.p_value <- bptest(model)[['p.value']]
+  BP.p_values <- c(BP.p_values, bp.p_value)
+  
+  print(model$call)
+  print(bp.p_value)
+}
+plot(BP.p_values)
+```
+### 3. Risk premia
+Next, we calculate the average excess returns for all our test portfolios and regress those on the coefficients from the previous step. We use both OLS and GLS without an intercept. The coefficients that result from this step are called "risk premia", and we test their significant. This is a two-pass regression, so we need to correct for the additional uncertainty.
+```{r}
+avg_portfolio_excess_returns <- colMeans(portfolio_excess_returns)
+
+dur_hat <- matrix(
+  c(coef(me1bm1)[2], coef(me1bm2)[2], coef(me1bm3)[2], coef(me1bm4)[2], coef(me1bm5)[2],
+    coef(me2bm1)[2], coef(me2bm2)[2], coef(me2bm3)[2], coef(me2bm4)[2], coef(me2bm5)[2], 
+    coef(me3bm1)[2], coef(me3bm2)[2], coef(me3bm3)[2], coef(me3bm4)[2], coef(me3bm5)[2],
+    coef(me4bm1)[2], coef(me4bm2)[2], coef(me4bm3)[2], coef(me4bm4)[2], coef(me4bm5)[2],
+    coef(me5bm1)[2], coef(me5bm2)[2], coef(me5bm3)[2], coef(me5bm4)[2], coef(me5bm5)[2])
+)
+nondur_hat <- matrix(
+  c(coef(me1bm1)[3], coef(me1bm2)[3], coef(me1bm3)[3], coef(me1bm4)[3], coef(me1bm5)[3],
+    coef(me2bm1)[3], coef(me2bm2)[3], coef(me2bm3)[3], coef(me2bm4)[3], coef(me2bm5)[3], 
+    coef(me3bm1)[3], coef(me3bm2)[3], coef(me3bm3)[3], coef(me3bm4)[3], coef(me3bm5)[3],
+    coef(me4bm1)[3], coef(me4bm2)[3], coef(me4bm3)[3], coef(me4bm4)[3], coef(me4bm5)[3],
+    coef(me5bm1)[3], coef(me5bm2)[3], coef(me5bm3)[3], coef(me5bm4)[3], coef(me5bm5)[3])
+)
+consumption_coefs <- cbind(dur_hat, nondur_hat) # the same as B later
+
+excess_returns_cons_coefs <- as.data.frame(
+  cbind(avg_portfolio_excess_returns, consumption_coefs)
+)
+colnames(excess_returns_cons_coefs) <- c('avg_excess_return', 'dur_coef', 'nondur_coef')
+
+Sigma_consumption <- var(consumption[,2:3]) # variance matrix of consumption factors
+
+ts.residuals <- c()
+for (model in ts_models){ 
+  ts.residuals <- cbind(ts.residuals, model$residuals)
+}
+Sigma_ts.residuals <- var(ts.residuals) # variance matrix of residuals from the first pass
+diag(var(ts.residuals))
+cor_ts.residuals <- cor(ts.residuals) # variance matrix of residuals from the first pass
+
+colnames(cor_ts.residuals) <- colnames(portfolio_excess_returns)
+row.names(cor_ts.residuals) <- colnames(portfolio_excess_returns)
+
+corr_plot.residuals <- corrplot(cor_ts.residuals, method='color', type="full",
+                      addCoef.col="white",
+                      order='alphabet', tl.col="black", tl.srt=30,
+                      number.cex=.4, tl.cex =.5,
+                      col = colors(20))
+corr_plot.residuals
+#ggsave('corr_plot_residuals.png', dpi=300, width=10, height=5)
+
+B <- consumption_coefs
+Time <- nrow(portfolio_excess_returns_consumption)
+
+###### 2nd pass
+# OLS
+ols_4.3 <- lm(data=excess_returns_cons_coefs, avg_excess_return ~ dur_coef + nondur_coef - 1)
+summary(ols_4.3)
+
+lambda.ols_vector <- as.matrix(ols_4.3$coefficients)
+# Correction for uncertainty about estimated factor exposures
+Shanken_term.ols <- as.numeric(1+t(lambda.ols_vector) %*% solve(Sigma_consumption)%*%
+                           lambda.ols_vector)
+Var_lambda.ols <- 1/Time * (solve(t(B)%*%B) %*% t(B)%*%Sigma_ts.residuals%*%B %*% 
+                            solve(t(B)%*%B) * Shanken_term.ols + Sigma_consumption
+                            )
+
+t_dur.ols <- lambda.ols_vector[1]/sqrt(Var_lambda.ols[1,1]) # durable C
+t_dur.ols
+1-pt(t_dur.ols, df=23) # p-value
+
+t_nondur.ols <- lambda.ols_vector[2]/sqrt(Var_lambda.ols[2,2]) # durable C
+1-pt(t_nondur.ols, df=23) # p-value
+
+plot(diag(var(portfolio_excess_returns)))
+n <- ncol(portfolio_excess_returns)
+(sum(cor(portfolio_excess_returns) > 0.7)-n)/(n^2 - n) # correlation of asset returns
+
+"lambda_gls = (B′ Σ^{−1} B)^{−1} B′Σ^{−1} r̄"
+lambda.gls <- solve(t(B) %*% solve(Sigma_ts.residuals) %*% B) %*%
+              t(B) %*% solve(Sigma_ts.residuals) %*% as.matrix(avg_portfolio_excess_returns)
+
+# Correction for uncertainty about estimated factor exposures
+Shanken_term.gls <- as.numeric(1 + t(lambda.gls) %*% solve(Sigma_consumption) %*% lambda.gls)
+Var_lambda.gls <- 1/Time * (solve(t(B) %*% solve(Sigma_ts.residuals) %*% B) *
+                            Shanken_term.gls + Sigma_consumption)
+gls.prediction <- B %*% lambda.gls
+
+t_dur.gls <- lambda.gls[1]/sqrt(Var_lambda.gls[1,1]) # durable C
+1-pt(t_dur.gls, df=23) # p-value
+
+t_nondur.gls <- lambda.gls[2]/sqrt(Var_lambda.gls[2,2]) # durable C
+1-pt(t_nondur.gls, df=23) # p-value
+```
+### 4. Pricing errors
+Now we estimate the pricing errors of the OLS and GLS and their standard errors and test whether the pricing errors are jointly equal to zero.
+```{r}
+pricing_error.ols <- excess_returns_cons_coefs$avg_excess_return - predict(ols_4.3)
+pricing_error.gls <- excess_returns_cons_coefs$avg_excess_return - gls.prediction
+
+# standard_errors of pricing errors
+M_tilde <- diag(1, dim(B)[1]) - B%*%solve((t(B)%*%solve(Sigma_ts.residuals)%*%B)) %*% t(B) %*% solve(Sigma_ts.residuals)
+
+Var_alpha.gls <- 1/Time * (Sigma_ts.residuals-B%*%solve(t(B)%*%solve(Sigma_ts.residuals)%*%B)%*%t(B)) * Shanken_term.gls
+
+# Test corrected for uncertainty in betas
+"The same test for OLS and GLS alphas"
+
+chi_stat <- Time/(1 + Shanken_term.gls) * t(pricing_error.gls) %*% solve(Sigma_ts.residuals) %*% pricing_error.gls
+
+1-pchisq(chi_stat, df=23) # p-value
+```
+## 5. Implied equity premium
+The risk premia that we estimated (with the OLS and GLS) are free parameters, i.e. we did not impose any restriction on them. But because of that, their values need not make economic sense. We can investigate this by checking the consequences for the market as a whole. To do so, we regress the excess return of the market also on the consumption growth rates and a constant (so we get the consumption betas for the market portfolio). When we multiply these beta-coefficients with the lambdas from the step 3, we find the implied equity premium.
+```{r}
+df.market_consumption <- cbind(raw_market$`Mkt-RF`, consumption) 
+row.names(df.market_consumption) <- df.market_consumption$Date
+df.market_consumption <- df.market_consumption %>% dplyr::select(-Date)
+colnames(df.market_consumption)[1] <- 'Mkt-RF'
+
+model.market_consumption <- lm(data=df.market_consumption, 
+                               `Mkt-RF` ~ Durables + `Non-durables`)
+summary(model.market_consumption)
+
+consumption_betas <- model.market_consumption$coefficients[2:3]
+
+as.matrix(consumption_betas) * lambda.gls
+sum(as.matrix(consumption_betas) * lambda.gls)
+mean(df.market_consumption$`Mkt-RF`)
+```
